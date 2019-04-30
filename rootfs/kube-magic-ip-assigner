@@ -95,35 +95,27 @@ while true; do
   fi
 
   iptables -L -nv -t nat --line-numbers > iptables.out
-
   MAGIC_IP_PATTERN=$(echo $MAGIC_IP | sed "s:\.:\.:g")
-
   rule_index=$(grep "${MAGIC_IP_PATTERN}" iptables.out | egrep "${PROTOCOL}\s+dpt:${MAGIC_PORT}" | tee grep.out | cut -d ' ' -f 1)
-
   cat grep.out
-
   echo "rule_index: ${rule_index}"
-
-  if [ "${DELETE}" != "" ]; then
-    iptables -D PREROUTING ${rule_index} -t nat
-    exit 0
-  fi
 
   EXTRA_ARGS=""
   if [ "$HOST_INTERFACE" != "" ]; then
     EXTRA_ARGS="-i $HOST_INTERFACE"
   fi
 
-  count=$(echo $rule_index | wc -l)
-  if [ $count -gt 1 ]; then
+  count_rules=$(echo $rule_index | wc -w)
+  echo "count rules: ${count_rules}"
+  if [ $count_rules -gt 1 ]; then
     iptables -D PREROUTING -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT $EXTRA_ARGS
-    MESSAGE="Excessed iptables rule has been deleted: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
+    echo "Excessed iptables rule has been deleted: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
   else
     if [ "${rule_index}" == "" ] || ! iptables -R PREROUTING ${rule_index} -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT $EXTRA_ARGS; then
       iptables -A PREROUTING -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT $EXTRA_ARGS
-      MESSAGE="Magic IP has been created: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
+      echo "Magic IP has been created: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
     else
-      MESSAGE="Magic IP has been checked: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
+      echo "Magic IP has been checked: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
     fi
   fi
 
