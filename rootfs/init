@@ -1,5 +1,5 @@
 #!/bin/sh
 
-set -vxe
+set -e
 
 exec dumb-init --single-child -- ./kube-magic-ip-assigner

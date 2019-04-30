@@ -5,23 +5,21 @@
 
 export
 
-if [ "${SELECTOR}" == "" ]; then
-  echo Environment variable \$SELECTOR is not set. 1>&2
+if [ "${SELECTOR}" != "" -a "${NODE_LOCAL_SERVICE_NAME}" != "" ]; then
+  echo Environment variable \$SELECTOR and \$NODE_LOCAL_SERVICE_NAME are set. Specify only either of them. 1>&2
+  exit 1
+elif [ "${SELECTOR}" == "" -a "${NODE_LOCAL_SERVICE_NAME}" == "" ]; then
+  echo Environment variable \$SELECTOR and \$NODE_LOCAL_SERVICE_NAME are not set. Specify either of them. 1>&2
   exit 1
 fi
 
-if [ "${HOST_INTERFACE}" == "" ]; then
-  echo Environment variable \$HOST_INTERFACE is not set. 1>&2
+if [ "${SELECTOR}" != "" -a "${NODE_NAME}" == "" ]; then
+  echo '[ERROR] Environment variable `NODE_NAME` has no value set. You must set it via PodSpec using the Downward API' 1>&2
   exit 1
 fi
 
 if [ "${NAMESPACE}" == "" ]; then
   echo '[ERROR] Environment variable `NAMESPACE` has no value set. You must set it via PodSpec like described in http://stackoverflow.com/a/34418819' 1>&2
-  exit 1
-fi
-
-if [ "${NODE_NAME}" == "" ]; then
-  echo '[ERROR] Environment variable `NODE_NAME` has no value set. You must set it via PodSpec using the Downward API' 1>&2
   exit 1
 fi
 
@@ -57,18 +55,6 @@ if [ ${VERBOSE} -eq 1 ]; then
   set -vx
 fi
 
-# Gather some information
-CURL="curl -s --connect-timeout 5"
-AZ_URL=${AZ_URL:-http://169.254.169.254/latest/meta-data/placement/availability-zone}
-AZ=$($CURL ${AZ_URL})
-INSTANCE_ID_URL=${INSTANCE_ID_URL:-http://169.254.169.254/latest/meta-data/instance-id}
-INSTANCE_ID=$($CURL ${INSTANCE_ID_URL})
-if [ -z $CLUSTER ]; then
-  echo "[WARNING] Environment variable CLUSTER has no name set. You can set this to get it reported in the Slack message." 1>&2
-else
-  CLUSTER_INFO=" (${CLUSTER})"
-fi
-
 POLL_INTERVAL=${POLL_INTERVAL:-5}
 
 echo "Polling the Kubernetes API every ${POLL_INTERVAL} second(s)"
@@ -79,59 +65,68 @@ while true; do
   selector="${SELECTOR}"
   namespace="${NAMESPACE}"
   node_name="${NODE_NAME}"
-  pod_ip=$(kubectl get po --selector ${selector} --namespace ${namespace} --output json | jq -r ".items[] | select(.spec.nodeName == \"${node_name}\") | .status.podIP")
 
-  pod_count=$(echo "${pod_ip}" | wc -l)
+  TARGET_IP=""
+  if [ "$SELECTOR" != "" ]; then
+    pod_ip=$(kubectl get po --selector ${selector} --namespace ${namespace} --output json | jq -r ".items[] | select(.spec.nodeName == \"${node_name}\") | .status.podIP")
 
-  if [ ${pod_count} -ne 1 ]; then
-    echo Failed to determine which pod to connect. There are ${pod_count} candidates: ${pod_ip} 1>&2
-    sleep $POLL_INTERVAL
-    continue
+    pod_count=$(echo "${pod_ip}" | wc -l)
+
+    if [ ${pod_count} -ne 1 ]; then
+      echo Failed to determine which pod to connect. There are ${pod_count} candidates: ${pod_ip} 1>&2
+      sleep $POLL_INTERVAL
+      continue
+    fi
+
+    TARGET_IP=${pod_ip}
+  else
+    node_port=$(kubectl get svc ${NODE_LOCAL_SERVICE_NAME} --namespace ${namespace} --output jsonpath='{.spec.ports[0].nodePort}')
+
+    svc_count=$(echo "${node_port}" | wc -l)
+
+    if [ ${svc_count} -ne 1 ]; then
+      echo Failed to determine which svc to connect. There are ${svc_count} candidates for ${NODE_LOCAL_SERVICE_NAME}: ${node_port} 1>&2
+      sleep $POLL_INTERVAL
+      continue
+    fi
+
+    TARGET_IP=${NODE_IP}
+    TARGET_PORT=${node_port}
   fi
 
-  TARGET_IP=${pod_ip}
+  iptables -L -nv -t nat --line-numbers > iptables.out
 
-  iptables -L -nv -t nat --line-numbers | tee iptables.out
+  MAGIC_IP_PATTERN=$(echo $MAGIC_IP | sed "s:\.:\.:g")
 
-  rule_index=$(grep $MAGIC_IP iptables.out | tee grep.out | cut -d ' ' -f 1)
+  rule_index=$(grep "${MAGIC_IP_PATTERN}" iptables.out | egrep "${PROTOCOL}\s+dpt:${MAGIC_PORT}" | tee grep.out | cut -d ' ' -f 1)
 
-  cat iptables.out grep.out
+  cat grep.out
 
-  echo rule_index: ${rule_index}
+  echo "rule_index: ${rule_index}"
 
   if [ "${DELETE}" != "" ]; then
     iptables -D PREROUTING ${rule_index} -t nat
     exit 0
   fi
 
-  if [ "${rule_index}" == "" ] || ! iptables -R PREROUTING ${rule_index} -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT -i $HOST_INTERFACE; then
-    iptables -A PREROUTING -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT -i $HOST_INTERFACE
-    MESSAGE="Magic IP has been created: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${CLUSTER_INFO}: ${NODE_NAME}, Instance: ${INSTANCE_ID}, AZ: ${AZ}"
+  EXTRA_ARGS=""
+  if [ "$HOST_INTERFACE" != "" ]; then
+    EXTRA_ARGS="-i $HOST_INTERFACE"
+  fi
+
+  count=$(echo $rule_index | wc -l)
+  if [ $count -gt 1 ]; then
+    iptables -D PREROUTING -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT $EXTRA_ARGS
+    MESSAGE="Excessed iptables rule has been deleted: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
   else
-    MESSAGE="Magic IP has been updated: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${CLUSTER_INFO}: ${NODE_NAME}, Instance: ${INSTANCE_ID}, AZ: ${AZ}"
-  fi
-
-  # Notify Hipchat
-  # Set the HIPCHAT_ROOM_ID & HIPCHAT_AUTH_TOKEN variables below.
-  # Further instructions at https://www.hipchat.com/docs/apiv2/auth
-  if [ "${HIPCHAT_AUTH_TOKEN}" != "" ]; then
-  curl -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $HIPCHAT_AUTH_TOKEN" \
-      -X POST \
-      -d "{\"color\": \"purple\", \"message_format\": \"text\", \"message\": \"${MESSAGE}\" }" \
-      https://api.hipchat.com/v2/room/$HIPCHAT_ROOM_ID/notification
-  fi
-
-  # Notify Slack incoming-webhook
-  # Docs: https://api.slack.com/incoming-webhooks
-  # Setup: https://slack.com/apps/A0F7XDUAZ-incoming-webhooks
-  #
-  # You will have to set SLACK_URL as an environment variable via PodSpec.
-  # The URL should look something like: https://hooks.slack.com/services/T67UBFNHQ/B4Q7WQM52/1ctEoFjkjdjwsa22934
-  #
-  if [ "${SLACK_URL}" != "" ]; then
-  curl -X POST --data "payload={\"text\": \":warning: ${MESSAGE}\"}" ${SLACK_URL}
+    if [ "${rule_index}" == "" ] || ! iptables -R PREROUTING ${rule_index} -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT $EXTRA_ARGS; then
+      iptables -A PREROUTING -t nat --dest $MAGIC_IP -p $PROTOCOL --dport $MAGIC_PORT -j DNAT --to-dest $TARGET_IP:$TARGET_PORT $EXTRA_ARGS
+      MESSAGE="Magic IP has been created: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
+    else
+      MESSAGE="Magic IP has been checked: $MAGIC_IP:$MAGIC_PORT will be routed to $TARGET_IP:$TARGET_PORT: ${NODE_NAME}"
+    fi
   fi
 
   sleep ${POLL_INTERVAL}
 done
+
